@@ -1,11 +1,16 @@
 name: release
 
-# Every push to main builds the firmware and publishes a GitHub Release with firmware.bin, which
-# the display pulls on boot and every 6 hours. Version: MAJOR.MINOR from VERSION; PATCH counts up
-# from the last released v<MAJOR>.<MINOR>.N tag. Bump MAJOR/MINOR by editing VERSION.
+# Every push to main that touches the firmware builds it and publishes a GitHub Release with
+# firmware.bin, which the display pulls on boot and every 6 hours. Version: MAJOR.MINOR from VERSION;
+# PATCH counts up from the last released v<MAJOR>.<MINOR>.N tag. Bump MAJOR/MINOR by editing VERSION.
+# (The server in server/ has its own workflow, server-publish.yml.)
 on:
   push:
     branches: [main]
+    paths:
+      - "src/**"
+      - "platformio.ini"
+      - "VERSION"
   workflow_dispatch:
 
 permissions:

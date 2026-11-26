@@ -7,3 +7,5 @@ config.json
 .nodeterm/
 .vscode/
 .idea/
+server/bin/
+server/obj/
