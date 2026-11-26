@@ -1,0 +1,54 @@
+name: release
+
+# Every push to main builds the firmware and publishes a GitHub Release with firmware.bin, which
+# the display pulls on boot and every 6 hours. Version: MAJOR.MINOR from VERSION; PATCH counts up
+# from the last released v<MAJOR>.<MINOR>.N tag. Bump MAJOR/MINOR by editing VERSION.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One release at a time, in push order, so two quick pushes never claim the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # need tags
+      - id: v
+        name: Version
+        run: |
+          BASE=$(tr -d '[:space:]' < VERSION)
+          [[ "$BASE" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "VERSION must be MAJOR.MINOR, got '$BASE'"; exit 1; }
+          LAST=$(git tag -l "v$BASE.*" | grep -E "^v${BASE//./\\.}\.[0-9]+$" | sort -V | tail -1 || true)
+          if [ -z "$LAST" ]; then PATCH=0; else PATCH=$(( ${LAST##*.} + 1 )); fi
+          echo "version=$BASE.$PATCH" >> "$GITHUB_OUTPUT"
+          echo "Releasing $BASE.$PATCH (previous: ${LAST:-none})"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install platformio==6.2.0
+      - name: Build
+        env:
+          FW_VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          test ! -e src/secrets.h || { echo "src/secrets.h must not be in the repo"; exit 1; }
+          pio run
+          cp .pio/build/esp32-8048s070/firmware.bin firmware.bin
+      - name: Create release (and tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "v$VERSION" firmware.bin --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Elvanto Display $VERSION" --generate-notes --latest

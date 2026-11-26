@@ -1,0 +1,9 @@
+# Credentials: local builds only (written to the device's config.json). Never commit.
+src/secrets.h
+config.json
+.pio/
+.venv/
+.DS_Store
+.nodeterm/
+.vscode/
+.idea/
