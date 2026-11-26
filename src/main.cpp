@@ -29,8 +29,10 @@
 static const char *OTA_REPO = "Asherslab/GSBC.ElvantoDisplay";
 static const uint32_t OTA_CHECK_MS = 6 * 3600 * 1000UL;
 
-// WiFi and Elvanto credentials, read from /config.json (SD card, else internal flash).
-struct Config { String ssid, pass, key; };
+// WiFi credentials and the server's address, read from /config.json (SD card, else internal flash).
+static const char *DEFAULT_SERVER = "192.168.3.150";        // the on-site k3s node
+static const char *DEFAULT_HOST = "elvanto-display.adp.au";  // its ingress host (LAN only)
+struct Config { String ssid, pass, server, host; };
 static Config conf;
 
 // ---------- display ----------
@@ -83,197 +85,68 @@ static String status = "Connecting...";
 static time_t lastOk = 0;
 static SemaphoreHandle_t lock;
 
-static time_t utcToEpoch(const char *s) {
-  // "YYYY-MM-DD HH:MM:SS" (UTC)
-  int y, mo, d, h, mi, se;
-  if (sscanf(s, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) return 0;
-  y -= mo <= 2;
-  int era = (y >= 0 ? y : y - 399) / 400;
-  unsigned yoe = (unsigned)(y - era * 400);
-  unsigned doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  long days = era * 146097L + (long)doe - 719468L;
-  return (time_t)days * 86400 + h * 3600 + mi * 60 + se;
-}
+// ---------- server ----------
+// The run sheet comes from the on-site server (server/ in this repo), which does the Elvanto work.
+// Plain HTTP to the node's IP with the ingress Host header, so no DNS and no TLS here; Arduino's
+// HTTPClient won't let the Host header be overridden, hence the hand-written request.
 
-static int parseDur(const char *s) {
-  int total = 0, part = 0;
-  for (; s && *s; s++) {
-    if (*s == ':') { total = total * 60 + part; part = 0; }
-    else if (isdigit((unsigned char)*s)) part = part * 10 + (*s - '0');
+// Sends a request and leaves `c` positioned at the response body.
+static bool serverRequest(WiFiClient &c, const char *method, const char *path, const String &body, int &status) {
+  status = 0;
+  if (!c.connect(conf.server.c_str(), 80, 5000)) return false;
+  c.setTimeout(10000);
+  c.printf("%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n", method, path, conf.host.c_str());
+  if (body.length()) c.printf("Content-Type: application/json\r\nContent-Length: %u\r\n", (unsigned)body.length());
+  c.print("\r\n");
+  c.print(body);
+  String line = c.readStringUntil('\n');  // "HTTP/1.1 200 OK"
+  if (line.length() > 12) status = line.substring(9, 12).toInt();
+  while (c.connected() || c.available()) {
+    line = c.readStringUntil('\n');
+    if (line.length() <= 1) break;  // blank line ends the headers
   }
-  // "MM:SS" or "HH:MM:SS"
-  return total * 60 + part;
+  return status > 0;
 }
 
-static String asciiOnly(const String &in) {
-  String out;
-  for (size_t i = 0; i < in.length(); i++) {
-    unsigned char c = in[i];
-    if (c < 0x80) { out += (char)c; continue; }
-    // common UTF-8 punctuation
-    if (c == 0xE2 && i + 2 < in.length()) {
-      unsigned char b = in[i + 1], d = in[i + 2];
-      if (b == 0x80 && (d == 0x98 || d == 0x99)) out += '\'';
-      else if (b == 0x80 && (d == 0x9C || d == 0x9D)) out += '"';
-      else if (b == 0x80 && (d == 0x93 || d == 0x94)) out += '-';
-      else if (b == 0x80 && d == 0xA6) out += "...";
-      i += 2;
-      continue;
-    }
-    while (i + 1 < in.length() && (in[i + 1] & 0xC0) == 0x80) i++;
+// The server's /display JSON, which is also the saved copy's format.
+static bool planFromJson(JsonDocument &d, Plan &p, time_t &fetched) {
+  p = Plan();
+  p.name = d["name"] | "";
+  p.start = d["start"] | 0L;
+  p.totalSec = d["total"] | 0;
+  fetched = d["fetched"] | 0L;
+  for (JsonObject o : d["items"].as<JsonArray>()) {
+    Item x;
+    x.heading = o["h"] | false;
+    x.when = o["when"] | "during";
+    x.title = o["title"] | "";
+    x.song = o["song"] | "";
+    x.desc = o["desc"] | "";
+    x.durSec = o["dur"] | 0;
+    x.start = o["start"] | 0L;
+    p.items.push_back(x);
   }
-  return out;
+  for (auto &x : p.items) p.sig += x.title + "|" + x.desc + "|" + x.song + "|" + x.durSec + "|" + x.when + "\n";
+  p.sig += p.name + String((long)p.start);
+  return !p.items.empty();
 }
 
-static String stripHtml(const char *html) {
-  String s = html ? html : "";
-  s.replace("</p>", "\n");
-  s.replace("<br>", "\n");
-  s.replace("<br />", "\n");
-  s.replace("</li>", "\n");
-  s.replace("<li>", "- ");
-  String out;
-  bool tag = false;
-  for (size_t i = 0; i < s.length(); i++) {
-    char c = s[i];
-    if (c == '<') tag = true;
-    else if (c == '>') tag = false;
-    else if (!tag) out += c;
-  }
-  out.replace("&nbsp;", " ");
-  out.replace("&amp;", "&");
-  out.replace("&quot;", "\"");
-  out.replace("&#39;", "'");
-  out.replace("&rsquo;", "'");
-  out.replace("&lsquo;", "'");
-  out.replace("&ldquo;", "\"");
-  out.replace("&rdquo;", "\"");
-  out.replace("&ndash;", "-");
-  out.replace("&mdash;", "-");
-  out.replace("&lt;", "<");
-  out.replace("&gt;", ">");
-  while (out.indexOf("\n\n") >= 0) out.replace("\n\n", "\n");
-  out.trim();
-  return asciiOnly(out);
-}
-
-// ---------- fetching ----------
+// Digits in the print code, from the server (0 until known: then 4-6 are accepted).
+static volatile int pinLength = 0;
 
 static bool fetchPlan(Plan &out, String &err) {
-  time_t now = time(nullptr);
-  time_t from = now - 86400;
-  struct tm g;
-  gmtime_r(&from, &g);
-  char date[16];
-  strftime(date, sizeof date, "%Y-%m-%d", &g);
-  char body[160];
-  snprintf(body, sizeof body, "{\"page\":1,\"page_size\":10,\"start\":\"%s\",\"fields\":[\"plans\"]}", date);
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.useHTTP10(true);  // no chunked encoding, so we can stream-parse
-  http.setTimeout(15000);
-  if (!http.begin(client, "https://api.elvanto.com/v1/services/getAll.json")) { err = "HTTP begin failed"; return false; }
-  http.setAuthorization(conf.key.c_str(), "x");
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST(body);
-  if (code != 200) { err = "HTTP " + String(code); http.end(); return false; }
-
-  JsonDocument filter;
-  filter["status"] = true;
-  filter["error"]["message"] = true;
-  JsonObject fs = filter["services"]["service"][0].to<JsonObject>();
-  fs["name"] = true;
-  fs["date"] = true;
-  JsonObject fi = fs["plans"]["plan"][0]["items"]["item"][0].to<JsonObject>();
-  fi["heading"] = true;
-  fi["duration"] = true;
-  fi["when"] = true;
-  fi["title"] = true;
-  fi["description"] = true;
-  fi["song"]["arrangement"]["key_name"] = true;
-  fi["song"]["arrangement"]["sequence"] = true;
-
-  JsonDocument doc;
-  DeserializationError de = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter), DeserializationOption::NestingLimit(24));
-  http.end();
-  if (de) { err = String("JSON ") + de.c_str(); return false; }
-  if (strcmp(doc["status"] | "", "ok") != 0) { err = String("Elvanto: ") + (doc["error"]["message"] | "error"); return false; }
-
-  // Services with a plan, in start order. Only start times are reliable, so a service stays up
-  // until 2 h before the next one, or the end of its own (local) day, whichever is first.
-  struct Cand { JsonObject s; time_t start; };
-  std::vector<Cand> cands;
-  for (JsonObject s : doc["services"]["service"].as<JsonArray>()) {
-    JsonArray items = s["plans"]["plan"][0]["items"]["item"];
-    if (items.isNull() || items.size() == 0) continue;
-    cands.push_back({s, utcToEpoch(s["date"] | "")});
-  }
-  std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) { return a.start < b.start; });
-
-  for (size_t ci = 0; ci < cands.size(); ci++) {
-    time_t start = cands[ci].start;
-    struct tm l;
-    localtime_r(&start, &l);
-    l.tm_mday += 1;
-    l.tm_hour = l.tm_min = l.tm_sec = 0;
-    time_t retire = mktime(&l);  // midnight after the service
-    if (ci + 1 < cands.size()) retire = min(retire, cands[ci + 1].start - 2 * 3600);
-    if (now >= retire) continue;
-
-    JsonObject s = cands[ci].s;
-    JsonArray items = s["plans"]["plan"][0]["items"]["item"];
-    Plan p;
-    p.name = asciiOnly(s["name"] | "");
-    p.start = start;
-    for (JsonObject it : items) {
-      Item x;
-      x.heading = (it["heading"].as<int>() == 1);
-      x.when = it["when"] | "during";
-      x.title = asciiOnly(it["title"] | "");
-      x.desc = stripHtml(it["description"] | "");
-      x.durSec = parseDur(it["duration"] | "");
-      if (it["song"].is<JsonObject>()) {
-        // Under a song: the item's note (usually the verses, e.g. "1 2 c 3"), falling back to
-        // the arrangement's sequence, shortened ("Verse 1" -> "V1").
-        String v = x.desc;
-        x.desc = "";
-        if (!v.length()) {
-          for (const char *sec : it["song"]["arrangement"]["sequence"].as<JsonArray>()) {
-            String part, num;
-            for (const char *c = sec; *c; c++) {
-              if (isdigit((unsigned char)*c)) num += *c;
-              else if (isalpha((unsigned char)*c) && (c == sec || c[-1] == ' ' || c[-1] == '-')) part += (char)toupper(*c);
-            }
-            if (v.length()) v += " ";
-            v += num.length() ? part + num : String(sec);
-          }
-        }
-        String k = it["song"]["arrangement"]["key_name"] | "";
-        if (k.length()) v += (v.length() ? "  -  Key " : "Key ") + k;
-        x.song = v;
-      }
-      p.items.push_back(x);
-    }
-    // Times: "before" items count down to the start, the rest run from it.
-    int beforeTotal = 0, during = 0;
-    for (auto &x : p.items) if (x.when == "before") beforeTotal += x.durSec;
-    int b = 0;
-    for (auto &x : p.items) {
-      if (x.when == "before") { x.start = start - beforeTotal + b; b += x.durSec; }
-      else { x.start = start + during; during += x.durSec; }
-    }
-    p.totalSec = during;
-
-    for (auto &x : p.items) p.sig += x.title + "|" + x.desc + "|" + x.song + "|" + x.durSec + "|" + x.when + "\n";
-    p.sig += p.name + String((long)p.start);
-    out = p;
-    return true;
-  }
-  err = "No upcoming service with a plan";
-  return false;
+  WiFiClient c;
+  int status;
+  if (!serverRequest(c, "GET", "/display", "", status)) { err = "Server unreachable"; return false; }
+  JsonDocument d;
+  DeserializationError e = deserializeJson(d, c);
+  c.stop();
+  if (status != 200) { err = String("Server: ") + (d["error"] | "error"); return false; }
+  if (e) { err = String("JSON ") + e.c_str(); return false; }
+  pinLength = d["pin_length"] | 0;
+  time_t fetched;
+  if (!planFromJson(d, out, fetched)) { err = "Empty run sheet"; return false; }
+  return true;
 }
 
 // ---------- saved copy ----------
@@ -301,12 +174,15 @@ static void initStorage() {
 }
 
 // ---------- config ----------
-// Released firmware carries no secrets: credentials live in /config.json on the SD card and in
+// Released firmware carries no credentials: they live in /config.json on the SD card and in
 // internal flash (so the card is optional). A local build with secrets.h writes that file.
+// The Elvanto key is no longer needed here (the server has it); a config that still holds one
+// is rewritten without it.
 
 static const char *CONFIG_FILE = "/config.json";
 
-static bool readConfig(fs::FS &fs) {
+static bool readConfig(fs::FS &fs, bool &hasOldKey) {
+  hasOldKey = false;
   File f = fs.open(CONFIG_FILE, "r");
   if (!f) return false;
   JsonDocument d;
@@ -315,36 +191,50 @@ static bool readConfig(fs::FS &fs) {
   if (!ok) return false;
   conf.ssid = d["wifi_ssid"] | "";
   conf.pass = d["wifi_pass"] | "";
-  conf.key = d["elvanto_key"] | "";
-  return conf.ssid.length() && conf.key.length();
+  conf.server = d["server"] | DEFAULT_SERVER;
+  conf.host = d["host"] | DEFAULT_HOST;
+  hasOldKey = d["elvanto_key"].is<const char *>();
+  return conf.ssid.length() > 0;
 }
 
 static void writeConfig(fs::FS &fs) {
   JsonDocument d;
   d["wifi_ssid"] = conf.ssid;
   d["wifi_pass"] = conf.pass;
-  d["elvanto_key"] = conf.key;
+  d["server"] = conf.server;
+  d["host"] = conf.host;
   File f = fs.open(CONFIG_FILE, "w");
   if (f) { serializeJson(d, f); f.close(); }
 }
 
 static bool loadConfig() {
+  bool found = false;
+  Config chosen;
+  for (int i = 0; i < 2; i++) {
+    bool sd = i == 0;
+    if (sd ? !storeIsSd : !haveFlashFs) continue;
+    fs::FS &fs = sd ? (fs::FS &)SD : (fs::FS &)LittleFS;
+    bool hasOldKey;
+    bool ok = readConfig(fs, hasOldKey);
 #ifdef WIFI_SSID
-  conf = {WIFI_SSID, WIFI_PASS, ELVANTO_KEY};
-  Config want = conf;
-  // Provision storage only where it differs, to avoid needless flash writes.
-  if (storeIsSd && !(readConfig(SD) && conf.ssid == want.ssid && conf.pass == want.pass && conf.key == want.key)) {
-    conf = want; writeConfig(SD); Serial.println("config: written to SD");
-  }
-  if (haveFlashFs && !(readConfig(LittleFS) && conf.ssid == want.ssid && conf.pass == want.pass && conf.key == want.key)) {
-    conf = want; writeConfig(LittleFS); Serial.println("config: written to flash");
-  }
-  conf = want;
-  return true;
+    // Provision storage only where it differs, to avoid needless flash writes.
+    Config want{WIFI_SSID, WIFI_PASS, DEFAULT_SERVER, DEFAULT_HOST};
+    if (!ok || hasOldKey || conf.ssid != want.ssid || conf.pass != want.pass || conf.server != want.server || conf.host != want.host) {
+      conf = want;
+      writeConfig(fs);
+      Serial.printf("config: written to %s\n", sd ? "SD" : "flash");
+    }
+    ok = true;
 #else
-  if (storeIsSd && readConfig(SD)) return true;
-  return haveFlashFs && readConfig(LittleFS);
+    if (ok && hasOldKey) {
+      writeConfig(fs);
+      Serial.printf("config: removed old Elvanto key from %s\n", sd ? "SD" : "flash");
+    }
 #endif
+    if (ok && !found) { found = true; chosen = conf; }
+  }
+  conf = chosen;
+  return found;
 }
 
 static void savePlan(const Plan &p, time_t fetched) {
@@ -381,26 +271,7 @@ static bool loadPlan(Plan &p, time_t &fetched) {
   DeserializationError e = deserializeJson(doc, f);
   f.close();
   if (e) { Serial.printf("load: %s\n", e.c_str()); return false; }
-  p = Plan();
-  p.name = doc["name"] | "";
-  p.start = doc["start"] | 0L;
-  p.totalSec = doc["total"] | 0;
-  fetched = doc["fetched"] | 0L;
-  for (JsonObject o : doc["items"].as<JsonArray>()) {
-    Item x;
-    x.heading = o["h"] | false;
-    x.when = o["when"] | "during";
-    x.title = o["title"] | "";
-    x.song = o["song"] | "";
-    x.desc = o["desc"] | "";
-    x.durSec = o["dur"] | 0;
-    x.start = o["start"] | 0L;
-    p.items.push_back(x);
-  }
-  // Same signature as fetchPlan() builds, so an unchanged fetch is not saved again.
-  for (auto &x : p.items) p.sig += x.title + "|" + x.desc + "|" + x.song + "|" + x.durSec + "|" + x.when + "\n";
-  p.sig += p.name + String((long)p.start);
-  return !p.items.empty();
+  return planFromJson(doc, p, fetched);
 }
 
 static void initPanel();
@@ -490,11 +361,14 @@ static void fetchTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(5000));
       continue;
     }
-    // On every boot (so a reboot updates) and every OTA_CHECK_MS after.
+    // On every boot (so a reboot updates) and every OTA_CHECK_MS after. A local (USB) build skips
+    // the boot check, so testing one doesn't immediately replace it with the latest release.
     if (!updateChecked || millis() - lastUpdateCheck > OTA_CHECK_MS) {
+      bool boot = !updateChecked;
       updateChecked = true;
       lastUpdateCheck = millis();
-      checkForUpdate();
+      if (boot && !*FW_VERSION) Serial.println("update: local build, skipping the boot check");
+      else checkForUpdate();
     }
     Plan p;
     String err;
@@ -614,7 +488,15 @@ static int layout(LGFX_Sprite *s, time_t now) {
     }
     y += h;
   }
-  return y + 40;  // a little space after the last item
+  // Running firmware version, centred under the last item.
+  if (s) {
+    s->setFont(&fonts::FreeSans9pt7b);
+    s->setTextColor(C_FAINT);
+    s->setTextDatum(textdatum_t::top_center);
+    s->drawString(*FW_VERSION ? String("Firmware v") + FW_VERSION : String("Firmware: local build"), W / 2, y + 16);
+    s->setTextDatum(textdatum_t::top_left);
+  }
+  return y + 52;
 }
 
 static void publishContent(int next, int h);
@@ -633,7 +515,12 @@ static LGFX_Sprite &newContent(int h) {
   }
   s.setRotation(1);
   s.setTextDatum(textdatum_t::top_left);  // sprites are reused; message() leaves it centred
-  s.fillScreen(C_BG);
+  // Clear in strips with a pause between: one ~0.5 MB fill hogs PSRAM long enough for the
+  // display refill to miss its deadline, which shows as a glitch whenever the list is redrawn.
+  for (int y = 0; y < s.height(); y += 64) {
+    s.fillRect(0, y, W, 64, C_BG);
+    delay(1);
+  }
   return s;
 }
 
@@ -701,6 +588,11 @@ static void drawHeader(time_t now, const String &st) {
   header.fillCircle(wx, wy, 2, bars ? C_TEXT : C_FAINT);
   for (int i = 1; i <= 3; i++)
     header.fillArc(wx, wy, 4 * i + 2, 4 * i, 225, 315, i <= bars ? C_TEXT : C_FAINT);
+  // Printer icon (tap for the print screen), under the clock.
+  int pxl = W - 54, pyt = 62;
+  header.drawRect(pxl + 8, pyt, 22, 10, C_DIM);            // paper in
+  header.fillRoundRect(pxl, pyt + 10, 38, 18, 4, C_DIM);   // body
+  header.fillRect(pxl + 8, pyt + 22, 22, 14, C_TEXT);      // paper out
   header.drawFastHLine(0, HEADER_H - 1, W, C_RULE);
   publishHeader(next);
 }
@@ -989,6 +881,169 @@ static void updateScroll(float dt) {
   scrollY = constrain(scrollY, 0.0f, (float)maxScroll());
 }
 
+// ---------- print ----------
+// Tap the printer icon in the header for the print screen: copies, a 4-6 digit code on a keypad,
+// then Print. The server checks the code (with a lockout) and sends the PDF to the printer.
+
+// Portrait x from the touch panel's native y. If taps land mirrored left-to-right, use (W - 1 - y).
+static inline int touchPortraitX(int y) { return y; }
+
+// A tap: short press that barely moved. Reports where it started, in portrait screen coordinates.
+static bool pollTap(int &tx, int &ty) {
+  static bool was = false;
+  static int sx, sy, lx, ly;
+  static uint32_t t0;
+  bool down = touchDown;
+  int x = touchPortraitX(touchY), y = H - 1 - touchX;
+  if (down && !was) { sx = lx = x; sy = ly = y; t0 = millis(); }
+  if (down) { lx = x; ly = y; }
+  bool tap = !down && was && millis() - t0 < 800 && abs(lx - sx) < 24 && abs(ly - sy) < 24;
+  if (tap) { tx = sx; ty = sy; }
+  was = down;
+  return tap;
+}
+
+struct Btn {
+  int x, y, w, h;
+  bool hit(int px, int py) const { return px >= x && px < x + w && py >= y && py < y + h; }
+};
+// In content coordinates (portrait, 0 = top of the area below the header).
+static const Btn B_MINUS{170, 92, 64, 56}, B_PLUS{346, 92, 64, 56};
+static const Btn B_CANCEL{20, 590, 210, 62}, B_PRINT{250, 590, 210, 62};
+static const char *KEYS = "123456789C0<";  // C = clear, < = delete
+static Btn keyBtn(int i) { return {60 + (i % 3) * 124, 262 + (i / 3) * 80, 112, 70}; }
+
+static bool printMode = false;
+static String pinEntry, printMsg;
+static uint8_t printMsgColor = C_DIM;
+static int printCopies = 1;
+static uint32_t printIdleMs = 0, printCloseAt = 0;
+static float savedScroll = 0;
+
+static int pinDigits() { return pinLength >= 4 && pinLength <= 6 ? pinLength : 6; }
+static bool pinReady() { return pinLength >= 4 && pinLength <= 6 ? (int)pinEntry.length() == pinLength : pinEntry.length() >= 4; }
+
+static void button(LGFX_Sprite &s, const Btn &b, const char *label, uint8_t bg, uint8_t fg, const lgfx::IFont *font) {
+  s.fillRoundRect(b.x, b.y, b.w, b.h, 10, bg);
+  s.setFont(font);
+  s.setTextColor(fg);
+  s.setTextDatum(textdatum_t::middle_center);
+  s.drawString(label, b.x + b.w / 2, b.y + b.h / 2);
+}
+
+static void drawPrintScreen() {
+  LGFX_Sprite &s = newContent(VIEW_H);
+  s.setTextDatum(textdatum_t::top_left);
+  s.setFont(&fonts::FreeSansBold12pt7b);
+  s.setTextColor(C_TEXT);
+  s.drawString("Print run sheet", 20, 22);
+  s.setFont(&fonts::FreeSans9pt7b);
+  s.setTextColor(C_DIM);
+  s.drawString(plan.name + ", 3 to a page", 20, 56);
+
+  s.setFont(&fonts::FreeSansBold12pt7b);
+  s.setTextColor(C_TEXT);
+  s.setTextDatum(textdatum_t::middle_left);
+  s.drawString("Pages", 20, B_MINUS.y + B_MINUS.h / 2);
+  button(s, B_MINUS, "-", C_HEADING, printCopies > 1 ? C_TEXT : C_FAINT, &fonts::FreeSansBold18pt7b);
+  button(s, B_PLUS, "+", C_HEADING, printCopies < 20 ? C_TEXT : C_FAINT, &fonts::FreeSansBold18pt7b);
+  s.setFont(&fonts::FreeSansBold18pt7b);
+  s.setTextDatum(textdatum_t::middle_center);
+  s.drawString(String(printCopies), (B_MINUS.x + B_MINUS.w + B_PLUS.x) / 2, B_MINUS.y + B_MINUS.h / 2);
+
+  // Code: a box per digit (as many as the server's code has), a dot per digit entered.
+  int boxes = pinDigits(), x0 = (W - (boxes * 54 - 10)) / 2;
+  for (int i = 0; i < boxes; i++) {
+    int x = x0 + i * 54, y = 170;
+    s.drawRoundRect(x, y, 44, 44, 8, i < (int)pinEntry.length() ? C_ACCENT : C_RULE);
+    if (i < (int)pinEntry.length()) s.fillCircle(x + 22, y + 22, 7, C_TEXT);
+  }
+  s.setFont(&fonts::FreeSans9pt7b);
+  s.setTextColor(printMsgColor);
+  s.drawString(printMsg.length() ? printMsg : String("Enter the print code"), W / 2, 236);
+
+  for (int i = 0; i < 12; i++) {
+    char k = KEYS[i];
+    const char *label = k == 'C' ? "Clear" : k == '<' ? "Del" : nullptr;
+    char d[2] = {k, 0};
+    button(s, keyBtn(i), label ? label : d, C_HEADING, C_TEXT, label ? &fonts::FreeSans12pt7b : &fonts::FreeSansBold18pt7b);
+  }
+  button(s, B_CANCEL, "Cancel", C_HEADING, C_TEXT, &fonts::FreeSansBold12pt7b);
+  bool ready = pinReady();
+  button(s, B_PRINT, "Print", ready ? C_ACCENT : C_HEADING, ready ? C_BG : C_FAINT, &fonts::FreeSansBold12pt7b);
+  s.setTextDatum(textdatum_t::top_left);
+  publishContent(contentCur ^ 1, VIEW_H);
+}
+
+static void openPrint() {
+  printMode = true;
+  pinEntry = "";
+  printMsg = "";
+  printMsgColor = C_DIM;
+  printCopies = 1;
+  printCloseAt = 0;
+  printIdleMs = millis();
+  savedScroll = scrollY;
+  scrollY = 0;
+  velocity = 0;
+  drawPrintScreen();
+}
+
+static void closePrint(time_t now) {
+  printMode = false;
+  pinEntry = "";  // don't keep the code around
+  scrollY = savedScroll;
+  rebuildContent(now);
+}
+
+static void sendPrint() {
+  printMsg = "Sending...";
+  printMsgColor = C_DIM;
+  drawPrintScreen();
+  JsonDocument req;
+  req["pin"] = pinEntry;
+  req["copies"] = printCopies;
+  String body;
+  serializeJson(req, body);
+  WiFiClient c;
+  int status;
+  JsonDocument res;
+  bool sent = serverRequest(c, "POST", "/print", body, status);
+  if (sent) deserializeJson(res, c);
+  c.stop();
+  bool ok = sent && status == 200 && (res["ok"] | false);
+  printMsg = sent ? String(res["message"] | (ok ? "Printing" : "Print failed")) : String("Server unreachable");
+  printMsgColor = ok ? C_ACCENT : C_ERR;
+  pinEntry = "";
+  if (ok) printCloseAt = millis() + 3000;
+  Serial.printf("print: %s\n", printMsg.c_str());
+  drawPrintScreen();
+}
+
+// Handles a tap on the print screen (content coordinates). Returns true if it should close.
+static bool printTap(int px, int py) {
+  printIdleMs = millis();
+  if (printCloseAt) return false;
+  if (B_CANCEL.hit(px, py)) return true;
+  if (B_MINUS.hit(px, py) && printCopies > 1) printCopies--;
+  else if (B_PLUS.hit(px, py) && printCopies < 20) printCopies++;
+  else if (B_PRINT.hit(px, py)) {
+    if (pinReady()) { sendPrint(); return false; }
+  } else {
+    for (int i = 0; i < 12; i++) {
+      if (!keyBtn(i).hit(px, py)) continue;
+      char k = KEYS[i];
+      if (k == 'C') pinEntry = "";
+      else if (k == '<') { if (pinEntry.length()) pinEntry.remove(pinEntry.length() - 1); }
+      else if ((int)pinEntry.length() < pinDigits()) pinEntry += k;
+      printMsg = "";
+      printMsgColor = C_DIM;
+    }
+  }
+  drawPrintScreen();
+  return false;
+}
+
 // ---------- main ----------
 
 void setup() {
@@ -1042,7 +1097,7 @@ void setup() {
   if (!cached) message("Syncing clock", "");
   t0 = millis();
   while (time(nullptr) < 1700000000 && millis() - t0 < 20000) delay(200);
-  if (!cached) message("Loading from Elvanto", "");
+  if (!cached) message("Loading run sheet", "");
 
   lock = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(fetchTask, "fetch", 16384, nullptr, 1, nullptr, 0);
@@ -1068,7 +1123,7 @@ void loop() {
   xSemaphoreGive(lock);
 
   if (!haveContent && plan.items.empty()) {
-    if (ms - lastHeaderMs > 1000) { lastHeaderMs = ms; if (st.length()) message("Waiting for Elvanto", st); }
+    if (ms - lastHeaderMs > 1000) { lastHeaderMs = ms; if (st.length()) message("Waiting for server", st); }
     delay(30);
     return;
   }
@@ -1078,9 +1133,13 @@ void loop() {
     lastMinute = now / 60;
     if (haveContent && currentIndex(now) != liveIdx) rebuild = true;
   }
-  if (rebuild || !haveContent) {
+  // While the print screen is up, list changes wait until it closes (closePrint redraws).
+  static bool rebuildLater = false;
+  if (printMode && rebuild) { rebuildLater = true; rebuild = false; }
+  if (!printMode && (rebuild || rebuildLater || !haveContent)) {
     rebuildContent(now);
     haveContent = true;
+    rebuildLater = false;
     lastHeaderMs = 0;
   }
 
@@ -1097,7 +1156,18 @@ void loop() {
     Serial.println("panel recreated (resync)");
   }
 
-  updateScroll(dt);
+  int tx, ty;
+  bool tap = pollTap(tx, ty);
+  if (printMode) {
+    bool close = tap && ty >= HEADER_H && printTap(tx, ty - HEADER_H);
+    if (close || millis() - printIdleMs > 60000 || (printCloseAt && millis() > printCloseAt)) {
+      closePrint(now);
+      rebuildLater = false;
+    }
+  } else {
+    if (tap && ty < HEADER_H && tx >= W - 80) openPrint();
+    else updateScroll(dt);
+  }
   publishScroll();
 
   static uint32_t statMs = 0, statFrames = 0;
