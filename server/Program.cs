@@ -8,7 +8,7 @@
 //   POST /print      {"pin": "1234", "copies": 2, "dryRun": false}  prints it (needs PRINT_PIN)
 //
 // Configuration (environment): ELVANTO_KEY, PRINT_PIN (4-6 digits), PRINTER_URI (default
-// ipps://192.168.2.254:443/ipp/print).
+// ipps://192.168.2.254:443/ipp/print), PRINT_SIDES (default two-sided-short-edge).
 
 using GSBC.ElvantoDisplay.Server;
 
@@ -29,9 +29,9 @@ var app = builder.Build();
 
 app.MapGet("/healthz", () => "ok");
 
-app.MapGet("/display", async (DateTimeOffset? at, RunSheetCache cache, ElvantoClient elvanto, CancellationToken ct) =>
+app.MapGet("/display", async (DateTimeOffset? at, RunSheetCache cache, ElvantoClient elvanto, IConfiguration config, CancellationToken ct) =>
     (at is { } t ? await elvanto.FetchCurrentAsync(t, ct) : cache.Current) is { } s
-        ? Results.Json(DisplayJson(s))
+        ? Results.Json(DisplayJson(s, config["PRINT_PIN"]?.Length ?? 0))
         : Results.Json(new { error = cache.Error ?? "loading" }, statusCode: 503));
 
 app.MapGet("/print.pdf", async (DateTimeOffset? at, RunSheetCache cache, ElvantoClient elvanto, CancellationToken ct) =>
@@ -55,8 +55,10 @@ app.MapPost("/print", async (PrintRequest req, RunSheetCache cache, PinGuard gua
 app.Run();
 
 // The display's format (the same JSON it keeps as its saved copy). Its fonts are 7-bit ASCII.
-static object DisplayJson(RunSheet s) => new
+// pin_length tells the keypad how many digits to ask for (0: printing not set up).
+static object DisplayJson(RunSheet s, int pinLength) => new
 {
+    pin_length = pinLength,
     name = Html.Ascii(s.Name),
     start = s.Start.ToUnixTimeSeconds(),
     total = s.Items.Where(i => i.When != "before").Sum(i => i.DurationSec),

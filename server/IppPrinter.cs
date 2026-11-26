@@ -31,7 +31,8 @@ public class IppPrinter(HttpClient http, IConfiguration config)
         body.WriteByte(0x02);  // job-attributes
         Int(body, "copies", copies);
         Attr(body, 0x44, "media", "iso_a4_210x297mm");
-        Attr(body, 0x44, "sides", "one-sided");
+        // Page 2 of a long plan goes on the back. Short-edge flip suits the landscape sheet.
+        Attr(body, 0x44, "sides", config["PRINT_SIDES"] ?? "two-sided-short-edge");
         body.WriteByte(0x03);  // end-of-attributes
         if (!validateOnly) body.Write(pdf);
 

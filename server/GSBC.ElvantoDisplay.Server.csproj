@@ -11,4 +11,9 @@
     <PackageReference Include="QuestPDF" Version="2026.9.2" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Liberation Sans (SIL OFL): Helvetica metrics, like Elvanto's print. Bundled so the container needs no system fonts. -->
+    <None Include="Fonts\*.ttf" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>
